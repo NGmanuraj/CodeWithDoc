@@ -1,0 +1,14 @@
+streamlit
+langchain
+langchain-chroma
+langchain-community
+langchain-core
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+pyyaml
+python-dotenv
+PyMuPDF
+python-docx
+sqlite3
+youtube-transcript-api
