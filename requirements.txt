@@ -10,5 +10,5 @@ pyyaml
 python-dotenv
 PyMuPDF
 python-docx
-sqlite3
+sqlite3==3.45.3
 youtube-transcript-api
