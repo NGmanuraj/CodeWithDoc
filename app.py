@@ -1,258 +1,234 @@
-# app.py
+import time
 import streamlit as st
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_chroma import Chroma
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from dotenv import load_dotenv
+from pypdf import PdfReader
+from langchain.text_splitter import CharacterTextSplitter  
 import os
-import fitz  # PyMuPDF
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import LLMChain
+from langchain import PromptTemplate
+import requests
+from bs4 import BeautifulSoup
 from docx import Document
-import json
+from dotenv import load_dotenv
 
-# Import database functions
-from database import save_document, get_documents
-from link_processing import process_link  # Import the link processing functions
-
-# Load environment variables
 load_dotenv()
+openai_api_key=os.getenv("OPENAI_API_KEY")
 
-# Constants
-API_KEY = os.getenv("GROQ_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
+# Set the page configuration at the top
+st.set_page_config(page_title="Intelligent Document Chatbot", page_icon="🤖", layout="wide")
 
-# Set up embeddings and LLM
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-llm = ChatGroq(groq_api_key=API_KEY, model_name="Gemma2-9b-It")
+# Custom CSS for enhanced UI
+st.markdown(
+    """
+    <style>
+    body {
+        background-color: #f0f4f8;
+        font-family: 'Helvetica Neue', Arial, sans-serif;
+    }
+    .title { color: #1a73e8; font-weight: bold; font-size: 3rem; text-align: center; }
+    .header { color: #3f51b5; font-weight: bold; font-size: 2.5rem; text-align: center; }
+    .message { border: 1px solid #ddd; padding: 10px; border-radius: 5px; margin-bottom: 10px; background-color: #ffffff; }
+    .user-message { background-color: #e1f5fe; color: #0d47a1; }
+    .assistant-message { background-color: #e8f5e9; color: #1b5e20; }
+    .stButton button {
+        background-color: #3f51b5;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        padding: 12px 24px;
+        font-size: 1.1rem;
+    }
+    .stButton button:hover {
+        background-color: #283593;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-# Set up Streamlit layout
-st.set_page_config(layout="wide")
+# Function to extract text from uploaded PDF files
+def get_pdf_text(pdf_docs):
+    text = ""
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:  # Check if text extraction was successful
+                text += page_text + "\n"
+    return text
 
-# Initialize documents
-documents = []
+# Function to extract text from uploaded DOCX files
+def get_docx_text(docx_files):
+    text = ""
+    for docx_file in docx_files:
+        doc = Document(docx_file)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+    return text
 
-# Document wrapper class
-class SimpleDocument:
-    def __init__(self, content: str, metadata: dict = None):
-        self.page_content = content
-        self.metadata = metadata or {}
+# Function to extract text from uploaded TXT files
+def get_txt_text(txt_files):
+    text = ""
+    for txt_file in txt_files:
+        text += txt_file.read().decode("utf-8") + "\n"
+    return text
 
-# Define session history functions before usage
-if 'store' not in st.session_state:
-    st.session_state.store = {}
-    st.session_state.documents_processed = False  # Flag to check if documents have been processed
-    st.session_state.messages = []  # Initialize messages
+# Function to extract text from web URLs
+def get_url_text(urls):
+    text = ""
+    for url in urls:
+        try:
+            response = requests.get(url)
+            response.raise_for_status()  # Raise an error for bad responses
+            soup = BeautifulSoup(response.text, 'html.parser')
+            paragraphs = soup.find_all('p')
+            for paragraph in paragraphs:
+                text += paragraph.get_text() + "\n"
+        except requests.exceptions.RequestException as e:
+            st.warning(f"Error fetching {url}: {e}")
+    return text
 
-def get_session_history(session: str) -> BaseChatMessageHistory:
-    if session not in st.session_state.store:
-        st.session_state.store[session] = ChatMessageHistory()
-    return st.session_state.store[session]
+# Function to split extracted text into manageable chunks
+def get_text_chunks(text):
+    text_splitter = CharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
+    chunks = text_splitter.split_text(text)
+    return chunks
 
-def truncate_messages(messages, max_length=4000):
-    total_length = 0
-    truncated_messages = []
-    
-    for message in reversed(messages):
-        message_length = len(message['content'])
-        if total_length + message_length > max_length:
-            break
-        truncated_messages.append(message)
-        total_length += message_length
-    
-    return list(reversed(truncated_messages))
+# Function to create and save a FAISS vector store for the text chunks
+def get_vector_store(text_chunks):
+    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
 
-# Sidebar: File Uploads, Link Input, and Clear Chat Button
-with st.sidebar:
-    st.header("Upload Documents or Enter Links")
-    
-    # File uploader
-    uploaded_files = st.file_uploader(
-        "Choose files (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True
-    )
-    
-    # Link input
-    link_input = st.text_input("Or enter a link (YouTube, website):", key="link_input", label_visibility='hidden', placeholder="Link website/Youtube")
+# Function to create a conversational chain using the OpenAI API
+def get_conversational_chain():
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context. If the answer is not in
+    the provided context, just say, "Answer is not available in the context"; don't provide the wrong answer.\n\n
+    Context:\n {context}\n
+    Question:\n {question}\n
+    Answer:
+    """
+    model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.3, openai_api_key=openai_api_key)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = LLMChain(llm=model, prompt=prompt)
+    return chain
 
-    if st.button("Clear Chat"):
-        st.session_state.messages = []
-    
-    # Handle file uploads
-    def process_pdf(file):
-        pdf_document = fitz.open(stream=file.read(), filetype="pdf")
-        text = "".join(page.get_text() for page in pdf_document)
-        return text
+def user_input(user_question):
+    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+    vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 
-    def process_docx(file):
-        doc = Document(file)
-        text = "\n".join(para.text for para in doc.paragraphs)
-        return text
+    context = vector_store.similarity_search(user_question, k=3)
+    context_text = "\n".join([doc.page_content for doc in context])
 
-    def process_txt(file):
-        text = file.read().decode("utf-8")
-        return text
+    chat_model = get_conversational_chain()  # Pass openai_api_key here
+    response = chat_model({"context": context_text, "question": user_question})
+    assistant_response = response['text']
 
-    if uploaded_files:
-        documents = []
-        for uploaded_file in uploaded_files:
-            if uploaded_file.type == "application/pdf":
-                text = process_pdf(uploaded_file)
-            elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                text = process_docx(uploaded_file)
-            elif uploaded_file.type == "text/plain":
-                text = process_txt(uploaded_file)
+    # Update chat history
+    st.session_state.chat_history.append({"user": user_question, "assistant": assistant_response})
+    return assistant_response  # Return the assistant's response
+
+import streamlit as st
+
+def main():
+    st.markdown("<h1 class='title'>Intelligent Document Chatbot</h1>", unsafe_allow_html=True)
+    st.markdown("<h2 class='header'>Engage in Conversational Queries with Your Documents</h2>", unsafe_allow_html=True)
+
+    # Initialize session state variables
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+   
+    if "data_processed" not in st.session_state:
+        st.session_state.data_processed = False
+
+    # Sidebar for API Key and file uploads based on file type selection
+    with st.sidebar:
+        st.markdown("<h3 class='header'>Upload Files</h3>", unsafe_allow_html=True)
+        file_type = st.selectbox("Select the type of content to upload and process", ('PDF', 'DOCX', 'TXT', 'URL'))
+
+        uploaded_files = None  # Variable to hold uploaded files based on type
+
+        if file_type == 'PDF':
+            uploaded_files = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, type=['pdf'])
+            if st.button("Submit & Process PDFs"):
+                if not uploaded_files:
+                    st.warning("Please upload PDF files before processing.")
+                else:
+                    with st.spinner("Processing PDFs..."):
+                        raw_text = get_pdf_text(uploaded_files)
+                        text_chunks = get_text_chunks(raw_text)
+                        get_vector_store(text_chunks)
+                        st.success("PDF files have been processed. You can ask questions now!")
+                        st.session_state.data_processed = True
+
+        elif file_type == 'DOCX':
+            uploaded_files = st.file_uploader("Upload your DOCX Files", accept_multiple_files=True, type=['docx'])
+            if st.button("Submit & Process DOCX"):
+                if not uploaded_files:
+                    st.warning("Please upload DOCX files before processing.")
+                else:
+                    with st.spinner("Processing DOCX files..."):
+                        raw_text = get_docx_text(uploaded_files)
+                        text_chunks = get_text_chunks(raw_text)
+                        get_vector_store(text_chunks)
+                        st.success("DOCX files have been processed. You can ask questions now!")
+                        st.session_state.data_processed = True
+
+        elif file_type == 'TXT':
+            uploaded_files = st.file_uploader("Upload your TXT Files", accept_multiple_files=True, type=['txt'])
+            if st.button("Submit & Process TXT"):
+                if not uploaded_files:
+                    st.warning("Please upload TXT files before processing.")
+                else:
+                    with st.spinner("Processing TXT files..."):
+                        raw_text = get_txt_text(uploaded_files)
+                        text_chunks = get_text_chunks(raw_text)
+                        get_vector_store(text_chunks)
+                        st.success("TXT files have been processed. You can ask questions now!")
+                        st.session_state.data_processed = True
+
+        elif file_type == 'URL':
+            url_input = st.text_area("Enter URLs (one per line):", height=200)
+            if st.button("Submit & Process URLs"):
+                if not url_input.strip():
+                    st.warning("Please enter at least one URL.")
+                else:
+                    urls = url_input.splitlines()  # Using splitlines for cleaner handling
+                    with st.spinner("Processing URLs..."):
+                        raw_text = get_url_text(urls)
+                        text_chunks = get_text_chunks(raw_text)
+                        get_vector_store(text_chunks)
+                        st.success("URLs have been processed. You can ask questions now!")
+                        st.session_state.data_processed = True
+
+    # User question input section
+    if st.session_state.data_processed:
+        st.markdown("<h3 class='header'>Ask a Question</h3>", unsafe_allow_html=True)
+        user_question = st.text_area("Type your question here:", height=100, placeholder="What would you like to ask?")
+
+        # Button to submit question
+        if st.button("Submit"):
+            if not user_question.strip():
+                st.warning("Please enter a question before submitting.")
             else:
-                st.warning("Unsupported file type.")
-                continue
-            
-            # Wrap text in SimpleDocument with metadata
-            metadata = {"source": uploaded_file.name}
-            documents.append(SimpleDocument(content=text, metadata=metadata))
+                with st.spinner("Getting the answer..."):
+                    answer = user_input(user_question)
+                    st.success("Here is your answer:")
+                    st.markdown(f"<div class='message assistant-message'>{answer}</div>", unsafe_allow_html=True)
+                    st.session_state.chat_history.append({'user': user_question, 'assistant': answer})  # Store the chat history
 
-        # Save documents to the database
-        for doc in documents:
-            save_document(doc.page_content, doc.metadata)
+        # Display chat history and clear history button
+        if st.session_state.chat_history:
+            st.markdown("<h3 class='header'>Chat History</h3>", unsafe_allow_html=True)
+            for chat in st.session_state.chat_history:
+                st.markdown(f"<div class='message user-message'>User: {chat['user']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='message assistant-message'>Assistant: {chat['assistant']}</div>", unsafe_allow_html=True)
+            if st.button("Clear History"):
+                st.session_state.chat_history = []
+                st.success("Chat history cleared!")
 
-    if link_input:
-        text = process_link(link_input)
-        if text != "Unsupported link type.":
-            documents.append(SimpleDocument(content=text, metadata={"source": link_input}))
-            save_document(text, {"source": link_input})
-        else:
-            st.warning("Unsupported link type.")
-    
-    # Retrieve documents and create vectorstore
-    saved_documents = get_documents()
-    documents = [SimpleDocument(content=doc[1], metadata=json.loads(doc[2])) for doc in saved_documents]
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
-    splits = text_splitter.split_documents(documents)
-
-    vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-    retriever = vectorstore.as_retriever()
-
-    # Create chat and QA chains
-    contextualize_q_system_prompt = (
-        "Given a chat history and the latest user question, "
-        "which might reference context in the chat history, "
-        "reformulate the question if needed. Do not answer the question."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-    )
-    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
-
-    system_prompt = (
-        "You are an assistant for question-answering tasks. "
-        "Use the following pieces of retrieved context to answer "
-        "the question. If you don't know the answer, say that you "
-        "don't know. Use three sentences maximum."
-        "\n\n{context}"
-    )
-    qa_prompt = ChatPromptTemplate.from_messages(
-        [("system", system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-    )
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-
-    conversational_rag_chain = RunnableWithMessageHistory(
-        rag_chain, get_session_history,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-        output_messages_key="answer"
-    )
-    st.session_state.documents_processed = True  # Set flag to True
-
-# Main area: Chat Interface
-st.title("Chat with 'Doc'")
-st.write("Upload Documents, Enter Links, And Ask Anything About Them")
-
-# Display chat history using a placeholder
-chat_placeholder = st.empty()
-
-# Input field and Ask button
-user_input = st.text_input("Your question:", key="user_input", label_visibility='hidden')
-ask_button = st.button("Ask")
-
-def handle_user_input(user_input):
-    if not st.session_state.documents_processed:
-        st.warning("No documents have been processed yet.")
-        return
-    
-    session_id = "default_session"  # Use a fixed session ID
-    session_history = get_session_history(session_id)
-
-    # Truncate messages before invoking the model
-    truncated_messages = truncate_messages(st.session_state.messages)
-
-    response = conversational_rag_chain.invoke(
-        {"input": user_input},
-        config={"configurable": {"session_id": session_id}}
-    )
-
-    # Update session history with the new question and answer
-    st.session_state.messages.append({'type': 'human', 'content': user_input})
-    st.session_state.messages.append({'type': 'assistant', 'content': response['answer']})
-
-    # Update chat history display
-    with chat_placeholder.container():
-        st.write(
-            """
-            <style>
-                .chat-container {
-                    display: flex;
-                    flex-direction: column;
-                    height: 500px;
-                    overflow-y: auto;
-                }
-                .message {
-                    margin: 10px;
-                    padding: 10px;
-                    border-radius: 10px;
-                }
-                .user-message {
-                    background-color: black;
-                }
-                .assistant-message {
-                    background-color: white;
-                    color:black;
-                }
-                .user-message::before {
-                    content: "You: ";
-                    font-weight: bold;
-                    color: white;
-                }
-                .assistant-message::before {
-                    content: "Assistant: ";
-                    font-weight: bold;
-                    color: black;
-                }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        chat_container = st.empty()
-
-        with chat_container.container():
-            for message in st.session_state.messages:
-                message_class = "user-message" if message['type'] == 'human' else "assistant-message"
-                st.markdown(f'<div class="message {message_class}">{message["content"]}</div>', unsafe_allow_html=True)
-
-    # Ensure the chat container scrolls to the bottom
-    st.write(
-        """
-        <script>
-            var chatContainer = document.getElementsByClassName('chat-container')[0];
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
-
-if ask_button and user_input:
-    handle_user_input(user_input)
+if __name__ == "__main__":
+    main()
