@@ -1,0 +1,14 @@
+streamlit
+openai
+langchain
+faiss-cpu
+sentence-transformers
+PyPDF2
+requests
+scikit-learn
+sqlalchemy
+youtube-dl
+PyMuPDF
+numpy
+python-dotenv
+beautifulsoup4
