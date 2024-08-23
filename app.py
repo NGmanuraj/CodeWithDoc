@@ -79,7 +79,7 @@ def load_url(url):
         return None
 
 def main():
-    st.title("🧠 Information Extraction & Retrieval App")
+    st.title("chat with 'DOC'")
 
     # Initialize session state if not already
     if 'chat_history' not in st.session_state:
@@ -100,7 +100,7 @@ def main():
 
     # User input and "Extract Specific Information" section
     with st.container():
-        st.header("🔍 Extract Specific Information")
+        st.header("Extract Specific Information")
 
     user_input = st.text_input("Type your message:", "")
     if st.button("Send") and user_input:
